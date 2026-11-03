@@ -1,0 +1,1571 @@
+
+/*
+  GALACTIC FRONTIER V35
+  MULTIPLAYER API SERVER
+
+  Runtime: Node.js
+  Dependency: ws
+
+  Features:
+  - WebSocket multiplayer API
+  - Player rooms
+  - Ship synchronization
+  - Character customization
+  - Shared mining
+  - Server-controlled resources
+  - Player health and shields
+  - Combat and respawning
+  - Chat
+  - Persistent world changes
+  - Player save data
+  - Ping / pong
+  - Rate limiting
+  - Automatic disconnect cleanup
+
+  Compatible with Galactic Frontier V34
+  using the existing:
+    join
+    state
+    appearance
+    mine
+    player
+    leave
+    world
+    welcome
+
+  Additional supported messages:
+    chat
+    fire
+    damage
+    respawn
+    world_request
+    inventory_request
+    ping
+*/
+
+"use strict";
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const WebSocket = require("ws");
+
+const CONFIG = {
+  PORT: Number(process.env.PORT) || 8080,
+  HOST: process.env.HOST || "0.0.0.0",
+
+  WORLD_SEED: 742193,
+
+  MAX_PLAYERS: 200,
+  MAX_PLAYERS_PER_ROOM: 40,
+
+  UPDATE_INTERVAL: 50,
+  BROADCAST_INTERVAL: 50,
+  SAVE_INTERVAL: 30000,
+
+  MAX_MESSAGE_BYTES: 16384,
+  MAX_MESSAGES_PER_SECOND: 45,
+
+  MAX_POSITION: 100000000,
+  MAX_MOVEMENT_SPEED: 1600,
+
+  MAX_CHAT_LENGTH: 180,
+
+  RESPAWN_DELAY: 5000,
+
+  DATA_DIR: path.join(
+    process.cwd(),
+    "galactic-frontier-data"
+  )
+};
+
+// ==========================================
+// GAME DATA
+// ==========================================
+
+const SHIPS = [
+  {
+    name: "EXECUTIONER",
+    hp: 180,
+    shield: 110,
+    speed: 60,
+    damage: 25,
+    cargo: 80,
+    price: 0
+  },
+  {
+    name: "TORMENTOR",
+    hp: 340,
+    shield: 220,
+    speed: 48,
+    damage: 40,
+    cargo: 150,
+    price: 2500
+  },
+  {
+    name: "NAGA",
+    hp: 1100,
+    shield: 750,
+    speed: 30,
+    damage: 105,
+    cargo: 350,
+    price: 18000
+  },
+  {
+    name: "ROKH",
+    hp: 2400,
+    shield: 1800,
+    speed: 20,
+    damage: 165,
+    cargo: 600,
+    price: 40000
+  },
+  {
+    name: "CHIMERA",
+    hp: 7000,
+    shield: 4500,
+    speed: 14,
+    damage: 240,
+    cargo: 1500,
+    price: 100000
+  }
+];
+
+const RESOURCE_VALUES = {
+  Titanium: 65,
+  Pyrite: 100,
+  Crystal: 160
+};
+
+const DEFAULT_APPEARANCE = {
+  name: "Explorer",
+  suit: "#e6edf4",
+  visor: "#346fa4",
+  armor: "#688ba6",
+  helmet: 0,
+  backpack: true
+};
+
+// ==========================================
+// UTILITY FUNCTIONS
+// ==========================================
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function finiteNumber(value, fallback = 0) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  ) ? value : fallback;
+}
+
+function safeString(value, max = 100) {
+  if (typeof value !== "string") return "";
+  return value.trim().slice(0, max);
+}
+
+function validVector(value, length) {
+  return (
+    Array.isArray(value) &&
+    value.length === length &&
+    value.every(
+      n => typeof n === "number" &&
+      Number.isFinite(n) &&
+      Math.abs(n) <= CONFIG.MAX_POSITION
+    )
+  );
+}
+
+function distance(a, b) {
+  const x = a[0] - b[0];
+  const y = a[1] - b[1];
+  const z = a[2] - b[2];
+
+  return Math.sqrt(x*x + y*y + z*z);
+}
+
+function normalizeQuaternion(q) {
+  if (!validVector(q, 4)) {
+    return [0, 0, 0, 1];
+  }
+
+  const length = Math.hypot(...q);
+
+  if (length < 0.000001) {
+    return [0, 0, 0, 1];
+  }
+
+  return q.map(n => n / length);
+}
+
+function safeColor(value, fallback) {
+  return (
+    typeof value === "string" &&
+    /^#[0-9a-fA-F]{6}$/.test(value)
+  ) ? value : fallback;
+}
+
+function sanitizeAppearance(input) {
+  const a = (
+    input &&
+    typeof input === "object" &&
+    !Array.isArray(input)
+  ) ? input : {};
+
+  return {
+    name: safeString(a.name, 24) || "Explorer",
+
+    suit: safeColor(
+      a.suit,
+      DEFAULT_APPEARANCE.suit
+    ),
+
+    visor: safeColor(
+      a.visor,
+      DEFAULT_APPEARANCE.visor
+    ),
+
+    armor: safeColor(
+      a.armor,
+      DEFAULT_APPEARANCE.armor
+    ),
+
+    helmet: clamp(
+      Math.floor(finiteNumber(a.helmet)),
+      0,
+      2
+    ),
+
+    backpack: a.backpack !== false
+  };
+}
+
+function createId() {
+  return crypto.randomUUID();
+}
+
+function timestamp() {
+  return Date.now();
+}
+
+// ==========================================
+// PERSISTENCE
+// ==========================================
+
+fs.mkdirSync(CONFIG.DATA_DIR, {
+  recursive: true
+});
+
+const WORLD_FILE = path.join(
+  CONFIG.DATA_DIR,
+  "worlds.json"
+);
+
+const PLAYER_FILE = path.join(
+  CONFIG.DATA_DIR,
+  "players.json"
+);
+
+function loadJSON(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+
+    const data = JSON.parse(
+      fs.readFileSync(file, "utf8")
+    );
+
+    return data;
+  } catch (error) {
+    console.error(
+      "Failed to load:",
+      file,
+      error.message
+    );
+
+    return fallback;
+  }
+}
+
+function saveJSON(file, data) {
+  const temp = file + ".tmp";
+
+  fs.writeFileSync(
+    temp,
+    JSON.stringify(data, null, 2),
+    "utf8"
+  );
+
+  fs.renameSync(temp, file);
+}
+
+const savedWorlds = loadJSON(
+  WORLD_FILE,
+  {}
+);
+
+const savedPlayers = loadJSON(
+  PLAYER_FILE,
+  {}
+);
+
+// ==========================================
+// SERVER STATE
+// ==========================================
+
+const players = new Map();
+const sockets = new Map();
+const rooms = new Map();
+const worlds = new Map();
+
+for (const [id, deposits] of Object.entries(
+  savedWorlds
+)) {
+  if (
+    Array.isArray(deposits) &&
+    deposits.length === 16
+  ) {
+    worlds.set(
+      id,
+      deposits.map(n =>
+        clamp(finiteNumber(n, 25), 0, 25)
+      )
+    );
+  }
+}
+
+// ==========================================
+// ROOMS
+// ==========================================
+
+function getRoom(roomId) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
+
+  return rooms.get(roomId);
+}
+
+function joinRoom(player, roomId) {
+  const nextRoom = getRoom(roomId);
+
+  if (
+    nextRoom.size >= CONFIG.MAX_PLAYERS_PER_ROOM
+  ) {
+    return false;
+  }
+
+  if (player.room) {
+    const oldRoom = rooms.get(player.room);
+
+    if (oldRoom) {
+      oldRoom.delete(player.id);
+
+      if (oldRoom.size === 0) {
+        rooms.delete(player.room);
+      }
+    }
+  }
+
+  player.room = roomId;
+  nextRoom.add(player.id);
+
+  return true;
+}
+
+function leaveRoom(player) {
+  if (!player.room) return;
+
+  const room = rooms.get(player.room);
+
+  if (room) {
+    room.delete(player.id);
+
+    if (room.size === 0) {
+      rooms.delete(player.room);
+    }
+  }
+
+  player.room = null;
+}
+
+// ==========================================
+// NETWORK SEND FUNCTIONS
+// ==========================================
+
+function send(socket, message) {
+  if (
+    socket &&
+    socket.readyState === WebSocket.OPEN
+  ) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+function sendToPlayer(playerId, message) {
+  send(sockets.get(playerId), message);
+}
+
+function broadcastRoom(
+  roomId,
+  message,
+  exceptId = null
+) {
+  const room = rooms.get(roomId);
+
+  if (!room) return;
+
+  const payload = JSON.stringify(message);
+
+  for (const id of room) {
+    if (id === exceptId) continue;
+
+    const socket = sockets.get(id);
+
+    if (
+      socket &&
+      socket.readyState === WebSocket.OPEN
+    ) {
+      socket.send(payload);
+    }
+  }
+}
+
+function sendError(player, code, message) {
+  sendToPlayer(player.id, {
+    type: "error",
+    code,
+    message
+  });
+}
+
+// ==========================================
+// PLAYER CREATION
+// ==========================================
+
+function createPlayer(id) {
+  return {
+    id,
+
+    name: "Explorer",
+
+    position: [0, 0, 0],
+    rotation: [0, 0, 0, 1],
+
+    ship: 0,
+
+    hp: SHIPS[0].hp,
+    shield: SHIPS[0].shield,
+
+    credits: 1500,
+
+    inventory: {
+      Titanium: 0,
+      Pyrite: 0,
+      Crystal: 0
+    },
+
+    ownedShips: [0],
+
+    appearance: {
+      ...DEFAULT_APPEARANCE
+    },
+
+    outside: false,
+    landed: false,
+    alive: true,
+
+    room: null,
+    joined: false,
+
+    lastUpdate: 0,
+    lastMovement: timestamp(),
+    lastFire: 0,
+
+    lastPosition: [0, 0, 0],
+
+    connectedAt: timestamp(),
+
+    messageCount: 0,
+    messageWindow: timestamp(),
+
+    respawnAt: 0,
+
+    saveKey: null
+  };
+}
+
+function publicPlayer(p) {
+  return {
+    id: p.id,
+    name: p.name,
+
+    position: p.position,
+    rotation: p.rotation,
+
+    ship: p.ship,
+
+    hp: p.hp,
+    shield: p.shield,
+
+    outside: p.outside,
+    landed: p.landed,
+    alive: p.alive,
+
+    appearance: p.appearance
+  };
+}
+
+// ==========================================
+// PLAYER SAVING
+// ==========================================
+
+function savePlayer(player) {
+  if (!player.saveKey) return;
+
+  savedPlayers[player.saveKey] = {
+    name: player.name,
+    ship: player.ship,
+
+    hp: player.hp,
+    shield: player.shield,
+
+    credits: player.credits,
+
+    inventory: {
+      ...player.inventory
+    },
+
+    ownedShips: [...player.ownedShips],
+
+    appearance: {
+      ...player.appearance
+    },
+
+    position: [...player.position],
+    rotation: [...player.rotation]
+  };
+}
+
+function restorePlayer(player, key) {
+  const saved = savedPlayers[key];
+
+  if (!saved) return;
+
+  player.name = safeString(
+    saved.name,
+    24
+  ) || "Explorer";
+
+  player.ownedShips = Array.isArray(
+    saved.ownedShips
+  )
+    ? saved.ownedShips.filter(
+        i => Number.isInteger(i) &&
+        i >= 0 &&
+        i < SHIPS.length
+      )
+    : [0];
+
+  if (!player.ownedShips.includes(0)) {
+    player.ownedShips.push(0);
+  }
+
+  const selected = clamp(
+    Math.floor(finiteNumber(saved.ship)),
+    0,
+    SHIPS.length - 1
+  );
+
+  player.ship = player.ownedShips.includes(
+    selected
+  ) ? selected : 0;
+
+  player.hp = clamp(
+    finiteNumber(saved.hp, SHIPS[player.ship].hp),
+    1,
+    SHIPS[player.ship].hp
+  );
+
+  player.shield = clamp(
+    finiteNumber(
+      saved.shield,
+      SHIPS[player.ship].shield
+    ),
+    0,
+    SHIPS[player.ship].shield
+  );
+
+  player.credits = clamp(
+    finiteNumber(saved.credits, 1500),
+    0,
+    1000000000
+  );
+
+  for (const resource of Object.keys(
+    RESOURCE_VALUES
+  )) {
+    player.inventory[resource] = clamp(
+      Math.floor(
+        finiteNumber(
+          saved.inventory?.[resource]
+        )
+      ),
+      0,
+      1000000
+    );
+  }
+
+  player.appearance = sanitizeAppearance(
+    saved.appearance
+  );
+
+  if (validVector(saved.position, 3)) {
+    player.position = [...saved.position];
+  }
+
+  if (validVector(saved.rotation, 4)) {
+    player.rotation = normalizeQuaternion(
+      saved.rotation
+    );
+  }
+}
+
+function saveEverything() {
+  for (const player of players.values()) {
+    savePlayer(player);
+  }
+
+  const worldData = {};
+
+  for (const [id, deposits] of worlds) {
+    worldData[id] = deposits;
+  }
+
+  saveJSON(WORLD_FILE, worldData);
+  saveJSON(PLAYER_FILE, savedPlayers);
+}
+
+// ==========================================
+// INFINITE WORLD RESOURCE STATE
+// ==========================================
+
+function getWorld(planetId) {
+  if (!worlds.has(planetId)) {
+    worlds.set(
+      planetId,
+      Array(16).fill(25)
+    );
+  }
+
+  return worlds.get(planetId);
+}
+
+function validPlanetId(id) {
+  return (
+    typeof id === "string" &&
+    /^-?\d+,-?\d+,-?\d+:\d+$/.test(id) &&
+    id.length <= 100
+  );
+}
+
+function cargoUsed(player) {
+  return Object.values(
+    player.inventory
+  ).reduce((sum, amount) => sum + amount, 0);
+}
+
+// ==========================================
+// MULTIPLAYER EVENTS
+// ==========================================
+
+function handleJoin(player, msg) {
+  if (player.joined) return;
+
+  const roomId = safeString(
+    msg.room || "galaxy",
+    32
+  ) || "galaxy";
+
+  if (!joinRoom(player, roomId)) {
+    sendError(
+      player,
+      "ROOM_FULL",
+      "This multiplayer room is full."
+    );
+    return;
+  }
+
+  player.name = safeString(
+    msg.name,
+    24
+  ) || "Explorer";
+
+  player.appearance = sanitizeAppearance(
+    msg.appearance
+  );
+
+  // Optional save key for prototype testing.
+  // Do not treat a client-provided key as authentication.
+  if (typeof msg.saveKey === "string") {
+    const key = safeString(msg.saveKey, 100);
+
+    if (/^[a-zA-Z0-9_-]{8,100}$/.test(key)) {
+      player.saveKey = key;
+      restorePlayer(player, key);
+    }
+  }
+
+  player.joined = true;
+
+  const members = [...getRoom(roomId)]
+    .filter(id => id !== player.id)
+    .map(id => players.get(id))
+    .filter(p => p && p.joined)
+    .map(publicPlayer);
+
+  sendToPlayer(player.id, {
+    type: "welcome",
+    id: player.id,
+    room: roomId,
+    worldSeed: CONFIG.WORLD_SEED,
+    players: members,
+    profile: {
+      credits: player.credits,
+      inventory: player.inventory,
+      ownedShips: player.ownedShips,
+      ship: player.ship,
+      hp: player.hp,
+      shield: player.shield,
+      appearance: player.appearance
+    }
+  });
+
+  broadcastRoom(
+    roomId,
+    {
+      type: "player",
+      player: publicPlayer(player)
+    },
+    player.id
+  );
+
+  console.log(
+    "JOIN",
+    player.id,
+    player.name,
+    roomId
+  );
+}
+
+function handleState(player, msg) {
+  if (!player.joined || !player.alive) return;
+
+  if (!validVector(msg.position, 3)) return;
+  if (!validVector(msg.rotation, 4)) return;
+
+  const now = timestamp();
+
+  if (
+    now - player.lastUpdate <
+    CONFIG.UPDATE_INTERVAL
+  ) return;
+
+  const elapsed = Math.max(
+    .001,
+    (now - player.lastMovement) / 1000
+  );
+
+  const travel = distance(
+    player.position,
+    msg.position
+  );
+
+  const maximum =
+    CONFIG.MAX_MOVEMENT_SPEED * elapsed + 30;
+
+  if (travel > maximum) {
+    sendToPlayer(player.id, {
+      type: "correction",
+      position: player.position,
+      rotation: player.rotation
+    });
+    return;
+  }
+
+  player.lastPosition = [...player.position];
+  player.position = [...msg.position];
+  player.rotation = normalizeQuaternion(
+    msg.rotation
+  );
+
+  // The client cannot grant itself a new ship.
+  const requestedShip = Math.floor(
+    finiteNumber(msg.ship, player.ship)
+  );
+
+  if (
+    player.ownedShips.includes(requestedShip)
+  ) {
+    player.ship = requestedShip;
+  }
+
+  player.outside = Boolean(msg.outside);
+
+  player.lastMovement = now;
+  player.lastUpdate = now;
+}
+
+function handleAppearance(player, msg) {
+  if (!player.joined) return;
+
+  player.appearance = sanitizeAppearance(
+    msg.appearance
+  );
+
+  player.name = player.appearance.name;
+
+  broadcastRoom(player.room, {
+    type: "player",
+    player: publicPlayer(player)
+  });
+}
+
+function handleMine(player, msg) {
+  if (!player.joined || !player.alive) return;
+
+  const planetId = msg.planetId;
+  const index = msg.deposit;
+  const requested = msg.amount;
+
+  if (!validPlanetId(planetId)) return;
+
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= 16
+  ) return;
+
+  if (
+    typeof requested !== "number" ||
+    !Number.isFinite(requested) ||
+    requested <= 0 ||
+    requested > 4
+  ) return;
+
+  // The V34 client does not send a verified
+  // landing state or deposit position.
+  // This remains a prototype mining API.
+  const deposits = getWorld(planetId);
+
+  const freeCargo = Math.max(
+    0,
+    SHIPS[player.ship].cargo -
+      cargoUsed(player)
+  );
+
+  const amount = Math.min(
+    requested,
+    deposits[index],
+    freeCargo
+  );
+
+  if (amount <= 0) return;
+
+  deposits[index] -= amount;
+
+  // Resource type is deterministic from
+  // planet ID for this server prototype.
+  const digest = crypto.createHash("sha256")
+    .update(planetId)
+    .digest();
+
+  const resources = [
+    "Titanium",
+    "Pyrite",
+    "Crystal"
+  ];
+
+  const resource = resources[
+    digest[0] % resources.length
+  ];
+
+  player.inventory[resource] += amount;
+
+  broadcastRoom(player.room, {
+    type: "world",
+    planetId,
+    deposits
+  });
+
+  sendToPlayer(player.id, {
+    type: "inventory",
+    inventory: player.inventory,
+    cargo: cargoUsed(player)
+  });
+}
+
+function handleWorldRequest(player, msg) {
+  if (!player.joined) return;
+
+  const planetId = msg.planetId;
+
+  if (!validPlanetId(planetId)) return;
+
+  sendToPlayer(player.id, {
+    type: "world",
+    planetId,
+    deposits: getWorld(planetId)
+  });
+}
+
+function handleChat(player, msg) {
+  if (!player.joined) return;
+
+  const message = safeString(
+    msg.message,
+    CONFIG.MAX_CHAT_LENGTH
+  );
+
+  if (!message) return;
+
+  broadcastRoom(player.room, {
+    type: "chat",
+    id: player.id,
+    name: player.name,
+    message,
+    time: timestamp()
+  });
+}
+
+// ==========================================
+// COMBAT
+// ==========================================
+
+function applyDamage(target, damage, attackerId) {
+  if (!target.alive) return;
+
+  const absorbed = Math.min(
+    target.shield,
+    damage
+  );
+
+  target.shield -= absorbed;
+  target.hp -= damage - absorbed;
+
+  if (target.hp <= 0) {
+    target.hp = 0;
+    target.alive = false;
+    target.respawnAt =
+      timestamp() + CONFIG.RESPAWN_DELAY;
+
+    broadcastRoom(target.room, {
+      type: "destroyed",
+      id: target.id,
+      attackerId,
+      position: target.position
+    });
+
+    const attacker = players.get(attackerId);
+
+    if (
+      attacker &&
+      attacker.id !== target.id
+    ) {
+      attacker.credits += 500;
+
+      sendToPlayer(attacker.id, {
+        type: "credits",
+        credits: attacker.credits,
+        reward: 500
+      });
+    }
+  }
+
+  broadcastRoom(target.room, {
+    type: "health",
+    id: target.id,
+    hp: target.hp,
+    shield: target.shield
+  });
+}
+
+function handleFire(player, msg) {
+  if (
+    !player.joined ||
+    !player.alive ||
+    player.outside
+  ) return;
+
+  const now = timestamp();
+
+  if (now - player.lastFire < 180) return;
+  player.lastFire = now;
+
+  const origin = player.position;
+
+  const direction = msg.direction;
+
+  if (!validVector(direction, 3)) return;
+
+  const length = Math.hypot(...direction);
+
+  if (length < .00001) return;
+
+  const dir = direction.map(n => n / length);
+
+  const damage = SHIPS[player.ship].damage;
+  const range = 450;
+
+  let bestTarget = null;
+  let bestDistance = Infinity;
+
+  const room = getRoom(player.room);
+
+  for (const id of room) {
+    if (id === player.id) continue;
+
+    const target = players.get(id);
+
+    if (!target || !target.alive) continue;
+
+    const dx = [
+      target.position[0] - origin[0],
+      target.position[1] - origin[1],
+      target.position[2] - origin[2]
+    ];
+
+    const along =
+      dx[0]*dir[0] +
+      dx[1]*dir[1] +
+      dx[2]*dir[2];
+
+    if (along < 0 || along > range) continue;
+
+    const closest = [
+      origin[0] + dir[0]*along,
+      origin[1] + dir[1]*along,
+      origin[2] + dir[2]*along
+    ];
+
+    const miss = distance(
+      target.position,
+      closest
+    );
+
+    if (miss < 12 && along < bestDistance) {
+      bestTarget = target;
+      bestDistance = along;
+    }
+  }
+
+  broadcastRoom(player.room, {
+    type: "laser",
+    id: player.id,
+    origin,
+    direction: dir,
+    damage
+  }, player.id);
+
+  if (bestTarget) {
+    applyDamage(
+      bestTarget,
+      damage,
+      player.id
+    );
+  }
+}
+
+function handleRespawn(player) {
+  if (player.alive) return;
+
+  if (timestamp() < player.respawnAt) return;
+
+  player.alive = true;
+  player.hp = SHIPS[player.ship].hp;
+  player.shield = SHIPS[player.ship].shield;
+
+  player.position = [0, 0, 0];
+  player.rotation = [0, 0, 0, 1];
+
+  broadcastRoom(player.room, {
+    type: "respawn",
+    player: publicPlayer(player)
+  });
+}
+
+// ==========================================
+// INVENTORY AND SHIP MARKET
+// ==========================================
+
+function handleInventoryRequest(player) {
+  sendToPlayer(player.id, {
+    type: "inventory",
+    inventory: player.inventory,
+    cargo: cargoUsed(player),
+    credits: player.credits
+  });
+}
+
+function handleSell(player) {
+  if (!player.joined || !player.alive) return;
+
+  let value = 0;
+
+  for (const resource of Object.keys(
+    RESOURCE_VALUES
+  )) {
+    value +=
+      player.inventory[resource] *
+      RESOURCE_VALUES[resource];
+
+    player.inventory[resource] = 0;
+  }
+
+  player.credits += value;
+
+  sendToPlayer(player.id, {
+    type: "trade",
+    soldFor: value,
+    credits: player.credits,
+    inventory: player.inventory
+  });
+}
+
+function handleBuyShip(player, msg) {
+  if (!player.joined || !player.alive) return;
+
+  const index = msg.ship;
+
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= SHIPS.length
+  ) return;
+
+  const ship = SHIPS[index];
+
+  if (!player.ownedShips.includes(index)) {
+    if (player.credits < ship.price) {
+      sendError(
+        player,
+        "INSUFFICIENT_CREDITS",
+        "Not enough credits."
+      );
+      return;
+    }
+
+    player.credits -= ship.price;
+    player.ownedShips.push(index);
+  }
+
+  player.ship = index;
+  player.hp = ship.hp;
+  player.shield = ship.shield;
+
+  sendToPlayer(player.id, {
+    type: "ship_purchased",
+    ship: index,
+    credits: player.credits,
+    ownedShips: player.ownedShips,
+    hp: player.hp,
+    shield: player.shield
+  });
+
+  broadcastRoom(player.room, {
+    type: "player",
+    player: publicPlayer(player)
+  }, player.id);
+}
+
+// ==========================================
+// RATE LIMITING
+// ==========================================
+
+function allowedMessage(player) {
+  const now = timestamp();
+
+  if (
+    now - player.messageWindow >= 1000
+  ) {
+    player.messageWindow = now;
+    player.messageCount = 0;
+  }
+
+  player.messageCount++;
+
+  return (
+    player.messageCount <=
+    CONFIG.MAX_MESSAGES_PER_SECOND
+  );
+}
+
+// ==========================================
+// HTTP API
+// ==========================================
+
+const httpServer = http.createServer(
+  (req, res) => {
+    const url = new URL(
+      req.url,
+      "http://localhost"
+    );
+
+    res.setHeader(
+      "Content-Type",
+      "application/json"
+    );
+
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      "*"
+    );
+
+    if (req.method !== "GET") {
+      res.writeHead(405);
+      res.end(JSON.stringify({
+        error: "Method not allowed"
+      }));
+      return;
+    }
+
+    if (url.pathname === "/api/status") {
+      res.writeHead(200);
+
+      res.end(JSON.stringify({
+        online: true,
+        game: "Galactic Frontier",
+        version: "35",
+        worldSeed: CONFIG.WORLD_SEED,
+        players: [...players.values()]
+          .filter(p => p.joined).length,
+        rooms: rooms.size,
+        generatedWorldStates: worlds.size
+      }));
+
+      return;
+    }
+
+    if (url.pathname === "/api/ships") {
+      res.writeHead(200);
+      res.end(JSON.stringify(SHIPS));
+      return;
+    }
+
+    if (url.pathname === "/api/rooms") {
+      res.writeHead(200);
+
+      res.end(JSON.stringify(
+        [...rooms.entries()].map(
+          ([id, members]) => ({
+            id,
+            players: members.size,
+            capacity:
+              CONFIG.MAX_PLAYERS_PER_ROOM
+          })
+        )
+      ));
+
+      return;
+    }
+
+    res.writeHead(404);
+    res.end(JSON.stringify({
+      error: "Not found"
+    }));
+  }
+);
+
+// ==========================================
+// WEBSOCKET SERVER
+// ==========================================
+
+const wss = new WebSocket.Server({
+  server: httpServer,
+  maxPayload: CONFIG.MAX_MESSAGE_BYTES
+});
+
+wss.on("connection", socket => {
+  if (
+    players.size >= CONFIG.MAX_PLAYERS
+  ) {
+    socket.close(
+      1013,
+      "Server full"
+    );
+    return;
+  }
+
+  const id = createId();
+  const player = createPlayer(id);
+
+  players.set(id, player);
+  sockets.set(id, socket);
+
+  socket.isAlive = true;
+
+  socket.on("pong", () => {
+    socket.isAlive = true;
+  });
+
+  socket.on("message", raw => {
+    if (!allowedMessage(player)) {
+      socket.close(
+        1008,
+        "Rate limit exceeded"
+      );
+      return;
+    }
+
+    let msg;
+
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (error) {
+      sendError(
+        player,
+        "INVALID_JSON",
+        "Invalid JSON message."
+      );
+      return;
+    }
+
+    if (
+      !msg ||
+      typeof msg !== "object" ||
+      Array.isArray(msg)
+    ) return;
+
+    switch (msg.type) {
+      case "join":
+        handleJoin(player, msg);
+        break;
+
+      case "state":
+        handleState(player, msg);
+        break;
+
+      case "appearance":
+        handleAppearance(player, msg);
+        break;
+
+      case "mine":
+        handleMine(player, msg);
+        break;
+
+      case "world_request":
+        handleWorldRequest(player, msg);
+        break;
+
+      case "chat":
+        handleChat(player, msg);
+        break;
+
+      case "fire":
+        handleFire(player, msg);
+        break;
+
+      case "respawn":
+        handleRespawn(player);
+        break;
+
+      case "inventory_request":
+        handleInventoryRequest(player);
+        break;
+
+      case "sell":
+        handleSell(player);
+        break;
+
+      case "buy_ship":
+        handleBuyShip(player, msg);
+        break;
+
+      case "ping":
+        sendToPlayer(player.id, {
+          type: "pong",
+          time: timestamp()
+        });
+        break;
+
+      default:
+        sendError(
+          player,
+          "UNKNOWN_EVENT",
+          "Unknown multiplayer event."
+        );
+    }
+  });
+
+  socket.on("close", () => {
+    savePlayer(player);
+
+    if (player.joined && player.room) {
+      broadcastRoom(
+        player.room,
+        {
+          type: "leave",
+          id: player.id
+        },
+        player.id
+      );
+    }
+
+    leaveRoom(player);
+
+    players.delete(id);
+    sockets.delete(id);
+
+    console.log(
+      "DISCONNECT",
+      id
+    );
+  });
+
+  socket.on("error", error => {
+    console.error(
+      "WebSocket error:",
+      error.message
+    );
+  });
+});
+
+// ==========================================
+// SERVER TICK
+// ==========================================
+
+setInterval(() => {
+  for (const [roomId, members] of rooms) {
+    for (const id of members) {
+      const player = players.get(id);
+
+      if (!player || !player.joined) continue;
+
+      broadcastRoom(
+        roomId,
+        {
+          type: "player",
+          player: publicPlayer(player)
+        },
+        player.id
+      );
+    }
+  }
+}, CONFIG.BROADCAST_INTERVAL);
+
+// ==========================================
+// HEALTH AND RESPAWN
+// ==========================================
+
+setInterval(() => {
+  for (const player of players.values()) {
+    if (!player.joined) continue;
+
+    if (!player.alive) {
+      if (timestamp() >= player.respawnAt) {
+        handleRespawn(player);
+      }
+      continue;
+    }
+
+    const maxShield =
+      SHIPS[player.ship].shield;
+
+    player.shield = Math.min(
+      maxShield,
+      player.shield + 8
+    );
+  }
+}, 1000);
+
+// ==========================================
+// CONNECTION HEALTH
+// ==========================================
+
+const heartbeat = setInterval(() => {
+  for (const socket of wss.clients) {
+    if (socket.isAlive === false) {
+      socket.terminate();
+      continue;
+    }
+
+    socket.isAlive = false;
+    socket.ping();
+  }
+}, 30000);
+
+// ==========================================
+// AUTOSAVE
+// ==========================================
+
+setInterval(() => {
+  try {
+    saveEverything();
+  } catch (error) {
+    console.error(
+      "Autosave failed:",
+      error.message
+    );
+  }
+}, CONFIG.SAVE_INTERVAL);
+
+// ==========================================
+// SHUTDOWN
+// ==========================================
+
+function shutdown() {
+  console.log("Saving Galactic Frontier...");
+
+  clearInterval(heartbeat);
+
+  try {
+    saveEverything();
+  } catch (error) {
+    console.error(error);
+  }
+
+  for (const socket of wss.clients) {
+    socket.close(
+      1001,
+      "Server shutting down"
+    );
+  }
+
+  httpServer.close(() => {
+    process.exit(0);
+  });
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+// ==========================================
+// START SERVER
+// ==========================================
+
+httpServer.listen(
+  CONFIG.PORT,
+  CONFIG.HOST,
+  () => {
+    console.log(
+      "================================="
+    );
+    console.log(
+      "GALACTIC FRONTIER V35"
+    );
+    console.log(
+      "MULTIPLAYER SERVER ONLINE"
+    );
+    console.log(
+      "PORT:", CONFIG.PORT
+    );
+    console.log(
+      "WORLD SEED:", CONFIG.WORLD_SEED
+    );
+    console.log(
+      "================================="
+    );
+  }
+);
